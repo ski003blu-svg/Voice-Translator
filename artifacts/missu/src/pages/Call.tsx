@@ -339,14 +339,14 @@ export default function Call() {
     };
   }, [isTranslating, startTranslation, stopTranslation]);
 
-  // When translation is ON, mute the local Agora track so the other person
-  // hears ONLY the translated TTS voice — not the raw original voice.
-  // When translation is OFF, restore the track (unless the user manually muted).
+  // Keep local Agora track in sync with the mute button only.
+  // Raw voice always flows through — translation plays as an overlay on top.
+  // (Muting raw voice when translation is ON caused total silence if TTS failed.)
   useEffect(() => {
     if (localTrackRef.current) {
-      localTrackRef.current.setMuted(isTranslating ? true : isMuted);
+      localTrackRef.current.setMuted(isMuted);
     }
-  }, [isTranslating, isMuted]);
+  }, [isMuted]);
 
   // Cleanup on unmount
   useEffect(() => {
