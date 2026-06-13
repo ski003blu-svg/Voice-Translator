@@ -1,12 +1,16 @@
 /**
- * WebSocket-based live translation server using ElevenLabs + MyMemory.
+ * WebSocket-based live translation server.
  *
- * Pipeline per utterance:
- * 1. Client sends a complete speech segment (VAD-gated audio blob)
- * 2. ElevenLabs Scribe STT  → transcript text
- * 3. MyMemory free API       → translated text (no API key needed)
- * 4a. ElevenLabs TTS (cloned voice) → translated audio sent as base64 JSON  [if voiceId set]
- * 4b. Fallback: send translated text → receiving client speaks via browser TTS [no voiceId]
+ * New model (receive-language):
+ * - Each client declares only the language they WANT TO HEAR (receiveLanguage).
+ * - Speaker language is auto-detected by ElevenLabs Scribe STT.
+ * - For every receiver in the room, text is translated into their receiveLanguage
+ *   and sent as synthesised audio.
+ *
+ * TTS routing:
+ *   Telugu  (no cloned voice)  → Google Translate TTS (te)
+ *   Other languages             → ElevenLabs eleven_multilingual_v2
+ *   Any language (cloned voice) → ElevenLabs eleven_multilingual_v2 + voiceId
  */
 
 import { Readable } from "stream";
@@ -20,34 +24,73 @@ const eleven = new ElevenLabsClient({
   apiKey: process.env["ELEVENLABS_API_KEY"] ?? "",
 });
 
-// Language codes used by ElevenLabs Scribe STT (ISO-639-1 / ISO-639-3)
-const STT_LANG: Record<string, string> = {
+// Default ElevenLabs voice used when the sender has no cloned voice
+const ELEVEN_DEFAULT_VOICE = "21m00Tcm4TlvDq8ikWAM"; // Rachel – stable multilingual voice
+
+// ─── Language maps ──────────────────────────────────────────────────────────
+
+/** Language name → ISO 639-1 code (used by Scribe and ElevenLabs) */
+const LANG_TO_ISO: Record<string, string> = {
   english: "en",
-  telugu: "te",
+  telugu:  "te",
+  hindi:   "hi",
+  spanish: "es",
+  tamil:   "ta",
+  french:  "fr",
+  german:  "de",
 };
 
-// MyMemory language pair codes
-const MT_LANG: Record<string, string> = {
-  english: "en-GB",
-  telugu: "te",
+/** ISO 639-1 → MyMemory language pair code */
+const ISO_TO_MYMEMORY: Record<string, string> = {
+  en: "en-GB",
+  te: "te",
+  hi: "hi",
+  es: "es",
+  ta: "ta",
+  fr: "fr",
+  de: "de",
 };
 
-/** Translate text using MyMemory (free, no API key, supports en ↔ te) */
-async function translateText(text: string, fromLang: string, toLang: string): Promise<string> {
-  const from = MT_LANG[fromLang] ?? fromLang;
-  const to   = MT_LANG[toLang]   ?? toLang;
+/** Language name → Google Translate TTS language code */
+const LANG_TO_GTTS: Record<string, string> = {
+  telugu:  "te",
+  hindi:   "hi",
+  tamil:   "ta",
+  spanish: "es",
+  french:  "fr",
+  german:  "de",
+  english: "en",
+};
+
+// ─── Translation ─────────────────────────────────────────────────────────────
+
+async function translateText(
+  text: string,
+  fromIso: string,
+  toLang: string,
+): Promise<string> {
+  const toIso   = LANG_TO_ISO[toLang] ?? toLang;
+  // If source and target are the same language, skip translation
+  if (fromIso === toIso) return text;
+
+  const from = ISO_TO_MYMEMORY[fromIso] ?? fromIso;
+  const to   = ISO_TO_MYMEMORY[toIso]   ?? toIso;
   const url  = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
 
   const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`MyMemory API error: ${resp.status}`);
+  if (!resp.ok) throw new Error(`MyMemory error: ${resp.status}`);
 
-  const data = await resp.json() as { responseStatus: number; responseData: { translatedText: string } };
-  if (data.responseStatus !== 200) throw new Error(`MyMemory returned status ${data.responseStatus}`);
+  const data = await resp.json() as {
+    responseStatus: number;
+    responseData: { translatedText: string };
+  };
+  if (data.responseStatus !== 200) throw new Error(`MyMemory status ${data.responseStatus}`);
 
   return data.responseData.translatedText.trim();
 }
 
-/** Drain a Readable stream into a Buffer */
+// ─── TTS ─────────────────────────────────────────────────────────────────────
+
 async function readableToBuffer(readable: Readable): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of readable) {
@@ -56,14 +99,81 @@ async function readableToBuffer(readable: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-// ─── Room management ────────────────────────────────────────────────────────
+/** Google Translate TTS – free, good quality for Indian languages */
+async function googleTTS(text: string, langCode: string): Promise<Buffer> {
+  const params = new URLSearchParams({
+    ie: "UTF-8",
+    q: text,
+    tl: langCode,
+    client: "gtx",
+    ttsspeed: "1",
+  });
+  const resp = await fetch(
+    `https://translate.google.com/translate_tts?${params}`,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        Referer: "https://translate.google.com/",
+      },
+    },
+  );
+  if (!resp.ok) throw new Error(`Google TTS HTTP ${resp.status}`);
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+/** ElevenLabs TTS – multilingual v2, supports most languages */
+async function elevenLabsTTS(
+  text: string,
+  voiceId: string,
+): Promise<Buffer> {
+  const stream = await eleven.textToSpeech.convert(voiceId, {
+    model_id: "eleven_multilingual_v2",
+    text,
+    voice_settings: { stability: 0.45, similarity_boost: 0.80 },
+  });
+  return readableToBuffer(stream as unknown as Readable);
+}
+
+/**
+ * Generate TTS audio for `receiveLang`.
+ *
+ * Priority:
+ *   1. Cloned voice (voiceId set) → ElevenLabs with voiceId
+ *   2. Telugu (no voiceId)        → Google Translate TTS
+ *   3. Other (no voiceId)         → ElevenLabs default voice
+ */
+async function generateTTS(
+  text: string,
+  receiveLang: string,
+  senderVoiceId: string | null,
+): Promise<Buffer> {
+  // 1 — Cloned voice: always use ElevenLabs with the sender's voice
+  if (senderVoiceId) {
+    return elevenLabsTTS(text, senderVoiceId);
+  }
+
+  // 2 — Telugu (no clone): Google Translate TTS
+  if (receiveLang === "telugu") {
+    try {
+      logger.info("Using Google TTS for Telugu");
+      return await googleTTS(text, "te");
+    } catch (err) {
+      logger.warn({ err }, "Google TTS failed for Telugu, falling back to ElevenLabs");
+    }
+  }
+
+  // 3 — All other languages (and Telugu fallback): ElevenLabs default voice
+  return elevenLabsTTS(text, ELEVEN_DEFAULT_VOICE);
+}
+
+// ─── Room management ─────────────────────────────────────────────────────────
 
 interface RoomClient {
   ws: WebSocket;
   roomId: string;
-  myLanguage: string;
-  friendLanguage: string;
-  voiceId: string | null;
+  receiveLanguage: string;   // The language this client wants to HEAR
+  voiceId: string | null;    // Cloned voice of THIS client (used when they are the sender)
   audioChunks: Buffer[];
   processingTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -90,19 +200,16 @@ async function processAudio(client: RoomClient): Promise<void> {
   const audioBuffer = Buffer.concat(client.audioChunks);
   client.audioChunks = [];
 
-  const myLang     = client.myLanguage;
-  const friendLang = client.friendLanguage;
-
   try {
     sendStatus(client.ws, "translating");
 
-    // Step 1 — STT: transcribe speaker's audio with ElevenLabs Scribe
+    // Step 1 — STT: auto-detect speaker language via ElevenLabs Scribe
     const audioBlob = new Blob([audioBuffer], { type: "audio/webm" });
 
     const transcription = await eleven.speechToText.convert({
       model_id: "scribe_v1",
       file: audioBlob,
-      language_code: STT_LANG[myLang] ?? "en",
+      // No language_code → Scribe auto-detects
       tag_audio_events: false,
     });
 
@@ -112,65 +219,55 @@ async function processAudio(client: RoomClient): Promise<void> {
       return;
     }
 
-    logger.info({ transcript, myLang, friendLang }, "STT transcript");
+    // Detected language ISO code (e.g. "en", "te", "hi")
+    const detectedIso: string =
+      (transcription as unknown as { language_code?: string }).language_code ?? "en";
 
-    // Step 2 — Translation: MyMemory free API
-    const translatedText = await translateText(transcript, myLang, friendLang);
-    if (!translatedText) {
+    logger.info({ transcript, detectedIso }, "STT result");
+
+    const others = getOtherClients(client);
+    if (others.length === 0) {
       sendStatus(client.ws, "listening");
       return;
     }
 
-    logger.info({ translatedText }, "Translated text");
+    // Step 2 — For each receiver, translate + generate TTS in their chosen language
+    await Promise.all(
+      others.map(async (receiver) => {
+        try {
+          const receiveLang = receiver.receiveLanguage;
 
-    const others = getOtherClients(client);
+          // Translate to receiver's language
+          const translatedText = await translateText(transcript, detectedIso, receiveLang);
+          if (!translatedText) return;
 
-    // Step 3a — If sender has a cloned voice, use ElevenLabs TTS and send audio
-    if (client.voiceId && others.length > 0) {
-      try {
-        logger.info({ voiceId: client.voiceId, textLen: translatedText.length }, "Generating TTS with cloned voice");
+          logger.info({ receiveLang, translatedText }, "Translated");
 
-        const audioStream = await eleven.textToSpeech.convert(client.voiceId, {
-          model_id: "eleven_multilingual_v2",
-          text: translatedText,
-          voice_settings: {
-            stability: 0.45,
-            similarity_boost: 0.80,
-          },
-        });
+          // Generate TTS (use SENDER's cloned voice if available)
+          const audioOut = await generateTTS(translatedText, receiveLang, client.voiceId);
 
-        const ttsBuffer = await readableToBuffer(audioStream as unknown as Readable);
-        const base64Audio = ttsBuffer.toString("base64");
-
-        for (const other of others) {
-          if (other.ws.readyState === WebSocket.OPEN) {
-            other.ws.send(JSON.stringify({
+          // Send audio + caption to receiver
+          if (receiver.ws.readyState === WebSocket.OPEN) {
+            receiver.ws.send(JSON.stringify({
               type: "audio_data",
-              data: base64Audio,
+              data: audioOut.toString("base64"),
               text: translatedText,
               mimeType: "audio/mpeg",
             }));
           }
-        }
-
-        logger.info({ bytes: ttsBuffer.length }, "TTS audio sent to peer");
-      } catch (ttsErr) {
-        // TTS failed — fall back to text so the other user still hears something
-        logger.warn({ ttsErr }, "ElevenLabs TTS failed, falling back to text");
-        for (const other of others) {
-          if (other.ws.readyState === WebSocket.OPEN) {
-            other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
+        } catch (err) {
+          logger.error({ err, receiveLang: receiver.receiveLanguage }, "Failed to generate for receiver");
+          // Fallback: send text so browser TTS can handle it
+          if (receiver.ws.readyState === WebSocket.OPEN) {
+            receiver.ws.send(JSON.stringify({
+              type: "speech",
+              text: transcript,
+              lang: receiver.receiveLanguage,
+            }));
           }
         }
-      }
-    } else {
-      // Step 3b — No cloned voice: forward text for browser Web Speech API
-      for (const other of others) {
-        if (other.ws.readyState === WebSocket.OPEN) {
-          other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
-        }
-      }
-    }
+      }),
+    );
 
     sendStatus(client.ws, "listening");
   } catch (err) {
@@ -189,7 +286,7 @@ function scheduleProcessing(client: RoomClient): void {
   }, 200);
 }
 
-// ─── WebSocket server ────────────────────────────────────────────────────────
+// ─── WebSocket server ─────────────────────────────────────────────────────────
 
 export function setupTranslationWebSocket(server: Server): void {
   const wss = new WebSocketServer({ server, path: "/ws/translate" });
@@ -200,8 +297,7 @@ export function setupTranslationWebSocket(server: Server): void {
     const client: RoomClient = {
       ws,
       roomId: "",
-      myLanguage: "english",
-      friendLanguage: "telugu",
+      receiveLanguage: "english",
       voiceId: null,
       audioChunks: [],
       processingTimer: null,
@@ -216,26 +312,23 @@ export function setupTranslationWebSocket(server: Server): void {
         return;
       }
 
-      // Text control message (JSON)
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "start") {
           client.roomId         = msg.roomId         || "default";
-          client.myLanguage     = msg.myLanguage     || "english";
-          client.friendLanguage = msg.friendLanguage || "telugu";
+          client.receiveLanguage = msg.receiveLanguage || "english";
           client.voiceId        = msg.voiceId        || null;
 
           if (!rooms.has(client.roomId)) rooms.set(client.roomId, []);
           rooms.get(client.roomId)!.push(client);
 
           logger.info(
-            { roomId: client.roomId, myLanguage: client.myLanguage, hasVoice: !!client.voiceId },
+            { roomId: client.roomId, receiveLanguage: client.receiveLanguage, hasVoice: !!client.voiceId },
             "Client joined room",
           );
           sendStatus(ws, "listening");
         }
       } catch {
-        // Non-JSON: treat as audio
         if (client.roomId) {
           client.audioChunks.push(data);
           scheduleProcessing(client);
@@ -246,7 +339,6 @@ export function setupTranslationWebSocket(server: Server): void {
     ws.on("close", () => {
       logger.info({ roomId: client.roomId }, "WebSocket client disconnected");
       if (client.processingTimer) clearTimeout(client.processingTimer);
-
       if (client.roomId) {
         const room = rooms.get(client.roomId);
         if (room) {
