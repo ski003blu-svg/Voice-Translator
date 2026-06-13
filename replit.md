@@ -18,7 +18,7 @@ A real-time Telugu ↔ English voice translation web app. Two users join the sam
 - Validation: Zod (`zod/v4`), `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
 - Build: esbuild (CJS bundle)
-- Translation: Gemini 2.0 Flash (STT + translation in one call) + Gemini 2.5 Flash TTS (speech synthesis)
+- Translation: ElevenLabs Scribe (STT) + MyMemory free API (text translation) + ElevenLabs TTS (speech synthesis)
 - Voice calling: Agora RTC Web SDK
 
 ## Where things live
