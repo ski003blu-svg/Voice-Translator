@@ -41,6 +41,8 @@ export default function Call() {
   const pendingSpeechRef = useRef<{ text: string; lang: string } | null>(null);
   // Ref to the speakText function itself so callbacks can call it without stale closure
   const speakTextRef = useRef<(text: string, lang: string) => void>(() => {});
+  // Safety timer — force-clears isTTSActiveRef if onend/onerror never fires (mobile bug)
+  const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -140,13 +142,20 @@ export default function Call() {
     setStatus("speaking");
     setCaption(text);
 
+    // Clear any previous safety timer before starting a new one
+    if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
+
+    // Chrome pauses speechSynthesis when the tab goes to background — resume first
     window.speechSynthesis.cancel();
+    window.speechSynthesis.resume();
 
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = langCode[lang] ?? "en-US";
     utter.rate = 0.92;
 
-    const onDone = () => {
+    const releaseLock = () => {
+      if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
+      safetyTimerRef.current = null;
       // 600ms cooldown after TTS ends — prevents mic from immediately picking up speaker echo
       setTimeout(() => {
         isTTSActiveRef.current = false;
@@ -160,13 +169,23 @@ export default function Call() {
       }, 600);
     };
 
-    utter.onend  = onDone;
-    utter.onerror = onDone;
+    utter.onend   = releaseLock;
+    utter.onerror = releaseLock;
     utteranceRef.current = utter;
+
+    // Safety timeout: if onend/onerror never fires (mobile Chrome silent failure),
+    // force-release the lock so subsequent translations aren't blocked forever.
+    // Estimate ~100ms per character + 5s buffer.
+    const estimatedMs = Math.max(5000, text.length * 100 + 3000);
+    safetyTimerRef.current = setTimeout(() => {
+      safetyTimerRef.current = null;
+      releaseLock();
+    }, estimatedMs);
+
     window.speechSynthesis.speak(utter);
   }, []);
 
-  // Keep speakTextRef in sync so the onDone callback can call the latest version
+  // Keep speakTextRef in sync so the releaseLock callback can call the latest version
   useEffect(() => {
     speakTextRef.current = speakText;
   }, [speakText]);
@@ -283,6 +302,7 @@ export default function Call() {
   }, [roomId, myLanguage, friendLanguage, speakText]);
 
   const stopTranslation = useCallback(() => {
+    if (safetyTimerRef.current) { clearTimeout(safetyTimerRef.current); safetyTimerRef.current = null; }
     window.speechSynthesis?.cancel();
     utteranceRef.current = null;
     isTTSActiveRef.current = false;
