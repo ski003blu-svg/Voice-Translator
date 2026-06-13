@@ -43,6 +43,8 @@ export default function Call() {
   const speakTextRef = useRef<(text: string, lang: string) => void>(() => {});
   // Safety timer — force-clears isTTSActiveRef if onend/onerror never fires (mobile bug)
   const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref mirror of isTranslating — lets the Agora user-published callback read current value
+  const isTranslatingRef = useRef(false);
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -77,6 +79,11 @@ export default function Call() {
           if (mediaType === "audio" && user.audioTrack) {
             remoteTracksRef.current[String(user.uid)] = user.audioTrack;
             user.audioTrack.play();
+            // If translation is already ON when this track arrives, silence it immediately
+            // so no raw voice leaks through while TTS handles the audio
+            if (isTranslatingRef.current) {
+              user.audioTrack.setVolume(0);
+            }
           }
         });
 
@@ -339,14 +346,23 @@ export default function Call() {
     };
   }, [isTranslating, startTranslation, stopTranslation]);
 
-  // Keep local Agora track in sync with the mute button only.
-  // Raw voice always flows through — translation plays as an overlay on top.
-  // (Muting raw voice when translation is ON caused total silence if TTS failed.)
+  // Keep isTranslatingRef in sync so Agora callbacks can read current translation state
+  useEffect(() => {
+    isTranslatingRef.current = isTranslating;
+  }, [isTranslating]);
+
+  // Mute/unmute Agora tracks based on translation state:
+  // - Sender side: mute own mic so the other person hears ONLY translated TTS, not raw voice
+  // - Receiver side: zero out remote track volume so no raw voice leaks through Agora
+  // Both sides independently silence Agora, both sides play TTS via the translation WS.
   useEffect(() => {
     if (localTrackRef.current) {
-      localTrackRef.current.setMuted(isMuted);
+      localTrackRef.current.setMuted(isTranslating || isMuted);
     }
-  }, [isMuted]);
+    Object.values(remoteTracksRef.current).forEach((track) => {
+      track.setVolume(isTranslating ? 0 : (isSpeakerOn ? 100 : 0));
+    });
+  }, [isTranslating, isMuted, isSpeakerOn]);
 
   // Cleanup on unmount
   useEffect(() => {
