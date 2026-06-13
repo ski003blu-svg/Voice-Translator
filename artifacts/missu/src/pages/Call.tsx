@@ -1,12 +1,16 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useLocation } from "wouter";
-import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Languages, Activity, ArrowRight } from "lucide-react";
+import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Languages, Activity, ArrowRight, UserCircle, Check, Loader2, StopCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useGetAgoraToken } from "@workspace/api-client-react";
 import AgoraRTC, { IAgoraRTCClient, IMicrophoneAudioTrack, IRemoteAudioTrack } from "agora-rtc-sdk-ng";
 import Waveform from "@/components/Waveform";
 
 type CallStatus = "idle" | "listening" | "translating" | "speaking";
+type VoiceCloneState = "idle" | "recording" | "uploading" | "ready" | "error";
+
+const VOICE_ID_KEY = "missu_voice_id";
+const MAX_RECORD_SECONDS = 30;
 
 export default function Call() {
   const [, setLocation] = useLocation();
@@ -21,8 +25,20 @@ export default function Call() {
   const [status, setStatus] = useState<CallStatus>("idle");
   const [isConnected, setIsConnected] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
-  // Caption: last translation received from the other user
   const [caption, setCaption] = useState<string>("");
+
+  // Voice cloning state
+  const [voiceCloneState, setVoiceCloneState] = useState<VoiceCloneState>(() => {
+    return localStorage.getItem(VOICE_ID_KEY) ? "ready" : "idle";
+  });
+  const [voiceId, setVoiceId] = useState<string | null>(() => {
+    return localStorage.getItem(VOICE_ID_KEY);
+  });
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Agora refs
   const clientRef = useRef<IAgoraRTCClient | null>(null);
@@ -33,18 +49,16 @@ export default function Call() {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  // Ref to track active speech utterance (for cancellation)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  // Blocks VAD audio sending while TTS is playing (set BEFORE speak() to close the gap)
   const isTTSActiveRef = useRef(false);
-  // Holds the latest speech to play after the current one finishes (prevents cancellation cascade)
   const pendingSpeechRef = useRef<{ text: string; lang: string } | null>(null);
-  // Ref to the speakText function itself so callbacks can call it without stale closure
   const speakTextRef = useRef<(text: string, lang: string) => void>(() => {});
-  // Safety timer — force-clears isTTSActiveRef if onend/onerror never fires (mobile bug)
   const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Ref mirror of isTranslating — lets the Agora user-published callback read current value
   const isTranslatingRef = useRef(false);
+
+  // Ref to mirror voiceId so WS callbacks always read latest value
+  const voiceIdRef = useRef<string | null>(voiceId);
+  useEffect(() => { voiceIdRef.current = voiceId; }, [voiceId]);
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -60,7 +74,6 @@ export default function Call() {
         setConnectError(null);
         const uid = Math.floor(Math.random() * 100000);
 
-        // Fetch Agora token from backend
         let response;
         try {
           response = await getTokenMutation.mutateAsync({
@@ -70,7 +83,6 @@ export default function Call() {
           throw new Error(`Token fetch failed: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        // Use h264 codec — universally supported on mobile (Safari iOS, Android Chrome)
         const client = AgoraRTC.createClient({ mode: "rtc", codec: "h264" });
         clientRef.current = client;
 
@@ -79,8 +91,6 @@ export default function Call() {
           if (mediaType === "audio" && user.audioTrack) {
             remoteTracksRef.current[String(user.uid)] = user.audioTrack;
             user.audioTrack.play();
-            // If translation is already ON when this track arrives, silence it immediately
-            // so no raw voice leaks through while TTS handles the audio
             if (isTranslatingRef.current) {
               user.audioTrack.setVolume(0);
             }
@@ -93,14 +103,12 @@ export default function Call() {
           }
         });
 
-        // Join the Agora channel
         try {
           await client.join(response.appId, response.channelName, response.token, response.uid);
         } catch (err) {
           throw new Error(`Channel join failed: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        // Request mic access and publish
         try {
           const localTrack = await AgoraRTC.createMicrophoneAudioTrack();
           localTrackRef.current = localTrack;
@@ -127,13 +135,46 @@ export default function Call() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // --- Speak translated text via browser Web Speech API ---
-  // Queue-based: if already speaking, store latest text and speak it when done.
-  // isTTSActiveRef is set IMMEDIATELY (not in onstart) to close the echo gap.
+  // --- Play incoming base64 audio (from server ElevenLabs TTS) ---
+  const playAudioData = useCallback((base64: string, text: string, mimeType = "audio/mpeg") => {
+    if (isTTSActiveRef.current) return;
+
+    isTTSActiveRef.current = true;
+    setStatus("speaking");
+    setCaption(text);
+
+    try {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+
+      const audio = new Audio(url);
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        isTTSActiveRef.current = false;
+        setStatus("listening");
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        isTTSActiveRef.current = false;
+        setStatus("listening");
+      };
+      audio.play().catch(() => {
+        isTTSActiveRef.current = false;
+        setStatus("listening");
+      });
+    } catch {
+      isTTSActiveRef.current = false;
+      setStatus("listening");
+    }
+  }, []);
+
+  // --- Speak translated text via browser Web Speech API (fallback, no cloned voice) ---
   const speakText = useCallback((text: string, lang: string) => {
     if (!window.speechSynthesis) return;
 
-    // If TTS is already playing, queue this as the next utterance (replace older pending)
     if (isTTSActiveRef.current) {
       pendingSpeechRef.current = { text, lang };
       return;
@@ -144,15 +185,12 @@ export default function Call() {
       telugu:  "te-IN",
     };
 
-    // Block VAD IMMEDIATELY — before speak() — so there's no window where mic is open
     isTTSActiveRef.current = true;
     setStatus("speaking");
     setCaption(text);
 
-    // Clear any previous safety timer before starting a new one
     if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
 
-    // Chrome pauses speechSynthesis when the tab goes to background — resume first
     window.speechSynthesis.cancel();
     window.speechSynthesis.resume();
 
@@ -160,11 +198,6 @@ export default function Call() {
     const targetLang = langCode[lang] ?? "en-US";
     utter.rate = 0.92;
 
-    // Voice selection: prefer exact match, then same language prefix (e.g. "te"),
-    // then any available voice as fallback.
-    // IMPORTANT: Only set utter.lang when we have a confirmed voice for it.
-    // If lang is set to e.g. "te-IN" but no Telugu voice exists, browsers
-    // silently discard the utterance — causing complete audio silence.
     const voices = window.speechSynthesis.getVoices();
     if (voices.length > 0) {
       const langPrefix = targetLang.split("-")[0];
@@ -172,21 +205,16 @@ export default function Call() {
       const prefixMatch = voices.find((v) => v.lang.startsWith(langPrefix));
       const bestMatch   = exactMatch ?? prefixMatch;
       if (bestMatch) {
-        // A voice for this language exists — use it
         utter.voice = bestMatch;
         utter.lang  = bestMatch.lang;
       }
-      // If no voice found for the target language, leave utter.lang unset so the
-      // browser uses its default voice and actually speaks rather than going silent.
     } else {
-      // Voices list not populated yet — set lang and hope the browser handles it
       utter.lang = targetLang;
     }
 
     const releaseLock = () => {
       if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
       safetyTimerRef.current = null;
-      // 600ms cooldown after TTS ends — prevents mic from immediately picking up speaker echo
       setTimeout(() => {
         isTTSActiveRef.current = false;
         const next = pendingSpeechRef.current;
@@ -203,9 +231,6 @@ export default function Call() {
     utter.onerror = releaseLock;
     utteranceRef.current = utter;
 
-    // Safety timeout: if onend/onerror never fires (mobile Chrome silent failure),
-    // force-release the lock so subsequent translations aren't blocked forever.
-    // Estimate ~100ms per character + 5s buffer.
     const estimatedMs = Math.max(5000, text.length * 100 + 3000);
     safetyTimerRef.current = setTimeout(() => {
       safetyTimerRef.current = null;
@@ -215,25 +240,29 @@ export default function Call() {
     window.speechSynthesis.speak(utter);
   }, []);
 
-  // Keep speakTextRef in sync so the releaseLock callback can call the latest version
   useEffect(() => {
     speakTextRef.current = speakText;
   }, [speakText]);
 
   // --- Translation WebSocket management ---
   const startTranslation = useCallback(async () => {
-    if (wsRef.current) return; // already connected
+    if (wsRef.current) return;
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${proto}//${window.location.host}/ws/translate`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
-
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "start", roomId, myLanguage, friendLanguage }));
+      ws.send(JSON.stringify({
+        type: "start",
+        roomId,
+        myLanguage,
+        friendLanguage,
+        voiceId: voiceIdRef.current ?? undefined,
+      }));
     };
 
     ws.onmessage = (event) => {
@@ -242,6 +271,8 @@ export default function Call() {
           const msg = JSON.parse(event.data);
           if (msg.type === "status") {
             setStatus(msg.status as CallStatus);
+          } else if (msg.type === "audio_data") {
+            playAudioData(msg.data as string, msg.text as string, msg.mimeType as string);
           } else if (msg.type === "speech") {
             speakText(msg.text as string, msg.lang as string);
           }
@@ -257,9 +288,6 @@ export default function Call() {
       setStatus("idle");
     };
 
-    // Capture mic audio with Voice Activity Detection (VAD)
-    // Only sends audio to the server when the user is actually speaking,
-    // which prevents burning through Gemini quota on silence.
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
@@ -271,7 +299,6 @@ export default function Call() {
       const recorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = recorder;
 
-      // --- Voice Activity Detection via Web Audio API ---
       const audioCtx = new AudioContext();
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -281,19 +308,18 @@ export default function Call() {
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let isSpeaking = false;
       let silenceFrames = 0;
-      const SPEECH_THRESHOLD = 25;   // RMS level — raised to reduce false triggers
-      const SILENCE_END_FRAMES = 30; // ~1s of quiet after speech before closing segment
+      const SPEECH_THRESHOLD = 25;
+      const SILENCE_END_FRAMES = 30;
 
       const checkVAD = () => {
-        if (!wsRef.current) return; // stop loop when WS closes
+        if (!wsRef.current) return;
         analyser.getByteFrequencyData(dataArray);
         const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
-        // Never start or continue recording while TTS is playing — prevents echo feedback
         if (isTTSActiveRef.current) {
           if (isSpeaking && recorder.state === "recording") {
             isSpeaking = false;
-            recorder.stop(); // discard what was recorded (it's TTS echo)
+            recorder.stop();
           }
           silenceFrames = 0;
           requestAnimationFrame(checkVAD);
@@ -317,19 +343,17 @@ export default function Call() {
         requestAnimationFrame(checkVAD);
       };
 
-      // When a speech segment finishes, send the full clip to the server
-      // (also guarded: skip if TTS was active when the segment ended)
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN && !isTTSActiveRef.current) {
           e.data.arrayBuffer().then((buf) => wsRef.current?.send(buf));
         }
       };
 
-      checkVAD(); // start the detection loop
+      checkVAD();
     } catch (err) {
       console.error("Mic access failed", err);
     }
-  }, [roomId, myLanguage, friendLanguage, speakText]);
+  }, [roomId, myLanguage, friendLanguage, speakText, playAudioData]);
 
   const stopTranslation = useCallback(() => {
     if (safetyTimerRef.current) { clearTimeout(safetyTimerRef.current); safetyTimerRef.current = null; }
@@ -347,7 +371,6 @@ export default function Call() {
     setStatus("idle");
   }, []);
 
-  // Toggle translation on/off
   useEffect(() => {
     if (isTranslating) {
       startTranslation();
@@ -359,15 +382,10 @@ export default function Call() {
     };
   }, [isTranslating, startTranslation, stopTranslation]);
 
-  // Keep isTranslatingRef in sync so Agora callbacks can read current translation state
   useEffect(() => {
     isTranslatingRef.current = isTranslating;
   }, [isTranslating]);
 
-  // Mute/unmute Agora tracks based on translation state:
-  // - Sender side: mute own mic so the other person hears ONLY translated TTS, not raw voice
-  // - Receiver side: zero out remote track volume so no raw voice leaks through Agora
-  // Both sides independently silence Agora, both sides play TTS via the translation WS.
   useEffect(() => {
     if (localTrackRef.current) {
       localTrackRef.current.setMuted(isTranslating || isMuted);
@@ -377,10 +395,99 @@ export default function Call() {
     });
   }, [isTranslating, isMuted, isSpeakerOn]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => stopTranslation();
   }, [stopTranslation]);
+
+  // --- Voice cloning ---
+  const stopVoiceRecording = useCallback(() => {
+    if (recordTimerRef.current) { clearInterval(recordTimerRef.current); recordTimerRef.current = null; }
+    if (autoStopTimerRef.current) { clearTimeout(autoStopTimerRef.current); autoStopTimerRef.current = null; }
+    voiceRecorderRef.current?.stop();
+  }, []);
+
+  const startVoiceRecording = useCallback(async () => {
+    if (voiceCloneState === "recording") {
+      stopVoiceRecording();
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceChunksRef.current = [];
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+
+      const recorder = new MediaRecorder(stream, { mimeType });
+      voiceRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) voiceChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        if (recordTimerRef.current) { clearInterval(recordTimerRef.current); recordTimerRef.current = null; }
+        if (autoStopTimerRef.current) { clearTimeout(autoStopTimerRef.current); autoStopTimerRef.current = null; }
+        setRecordSeconds(0);
+
+        const audioBlob = new Blob(voiceChunksRef.current, { type: mimeType });
+        if (audioBlob.size < 5000) {
+          setVoiceCloneState("error");
+          setTimeout(() => setVoiceCloneState("idle"), 3000);
+          return;
+        }
+
+        setVoiceCloneState("uploading");
+
+        try {
+          const resp = await fetch("/api/voices/clone", {
+            method: "POST",
+            headers: { "Content-Type": mimeType },
+            body: audioBlob,
+          });
+
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ error: "Unknown error" }));
+            throw new Error((err as { error: string }).error);
+          }
+
+          const { voiceId: newId } = await resp.json() as { voiceId: string };
+          localStorage.setItem(VOICE_ID_KEY, newId);
+          setVoiceId(newId);
+          setVoiceCloneState("ready");
+        } catch (err) {
+          console.error("Voice cloning failed:", err);
+          setVoiceCloneState("error");
+          setTimeout(() => setVoiceCloneState("idle"), 3000);
+        }
+      };
+
+      recorder.start(200);
+      setVoiceCloneState("recording");
+      setRecordSeconds(0);
+
+      recordTimerRef.current = setInterval(() => {
+        setRecordSeconds((s) => s + 1);
+      }, 1000);
+
+      autoStopTimerRef.current = setTimeout(() => {
+        stopVoiceRecording();
+      }, MAX_RECORD_SECONDS * 1000);
+    } catch (err) {
+      console.error("Mic access failed for voice clone:", err);
+      setVoiceCloneState("error");
+      setTimeout(() => setVoiceCloneState("idle"), 3000);
+    }
+  }, [voiceCloneState, stopVoiceRecording]);
+
+  const clearVoice = () => {
+    localStorage.removeItem(VOICE_ID_KEY);
+    setVoiceId(null);
+    setVoiceCloneState("idle");
+  };
 
   const toggleMute = () => {
     if (localTrackRef.current) {
@@ -425,7 +532,6 @@ export default function Call() {
 
   return (
     <div className="min-h-screen w-full flex flex-col bg-background text-foreground relative overflow-hidden">
-      {/* Ambient background glow */}
       <div
         className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] h-[80vh] rounded-full blur-[150px] pointer-events-none transition-colors duration-1000 ${
           status === "listening"   ? "bg-primary/10"    :
@@ -503,13 +609,68 @@ export default function Call() {
             </p>
           )}
 
-          {/* Translation caption — shows the latest translated text received */}
           {caption && isTranslating && (
             <div className="max-w-xs w-full bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
               <p className="text-xs text-muted-foreground uppercase tracking-widest mb-1">Translation</p>
               <p className="text-sm text-white/90 leading-relaxed">{caption}</p>
             </div>
           )}
+
+          {/* Voice Clone Panel */}
+          <div className="max-w-xs w-full">
+            {voiceCloneState === "idle" && (
+              <button
+                onClick={startVoiceRecording}
+                className="flex items-center gap-2 mx-auto px-4 py-2 rounded-full bg-white/5 border border-white/10 text-sm text-muted-foreground hover:bg-white/10 hover:text-white transition-all"
+              >
+                <UserCircle className="w-4 h-4" />
+                Clone your voice for translation
+              </button>
+            )}
+
+            {voiceCloneState === "recording" && (
+              <div className="flex flex-col items-center gap-2">
+                <p className="text-xs text-white/60">
+                  Speak naturally — {MAX_RECORD_SECONDS - recordSeconds}s remaining
+                </p>
+                <button
+                  onClick={stopVoiceRecording}
+                  className="flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/20 border border-red-500/40 text-sm text-red-400 hover:bg-red-500/30 transition-all animate-pulse"
+                >
+                  <StopCircle className="w-4 h-4" />
+                  Stop recording ({recordSeconds}s)
+                </button>
+              </div>
+            )}
+
+            {voiceCloneState === "uploading" && (
+              <div className="flex items-center gap-2 mx-auto w-fit px-4 py-2 rounded-full bg-white/5 border border-white/10 text-sm text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Cloning your voice...
+              </div>
+            )}
+
+            {voiceCloneState === "ready" && (
+              <div className="flex items-center justify-center gap-3">
+                <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-green-500/10 border border-green-500/30 text-sm text-green-400">
+                  <Check className="w-4 h-4" />
+                  Your voice is active
+                </div>
+                <button
+                  onClick={clearVoice}
+                  className="text-xs text-white/30 hover:text-white/60 transition-colors underline underline-offset-2"
+                >
+                  Reset
+                </button>
+              </div>
+            )}
+
+            {voiceCloneState === "error" && (
+              <p className="text-xs text-destructive text-center">
+                Voice cloning failed. Please try again.
+              </p>
+            )}
+          </div>
         </div>
       </main>
 
@@ -537,8 +698,6 @@ export default function Call() {
             variant="ghost"
             size="icon"
             onClick={() => {
-              // Prime speechSynthesis synchronously inside the user gesture so mobile
-              // browsers (Android Chrome) unlock audio before the async pipeline fires.
               if (!isTranslating && window.speechSynthesis) {
                 const primer = new SpeechSynthesisUtterance(" ");
                 primer.volume = 0;

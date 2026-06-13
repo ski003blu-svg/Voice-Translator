@@ -5,10 +5,11 @@
  * 1. Client sends a complete speech segment (VAD-gated audio blob)
  * 2. ElevenLabs Scribe STT  → transcript text
  * 3. MyMemory free API       → translated text (no API key needed)
- * 4. ElevenLabs TTS          → translated audio (mp3)
- * 5. Server forwards audio to the OTHER client in the same room
+ * 4a. ElevenLabs TTS (cloned voice) → translated audio sent as base64 JSON  [if voiceId set]
+ * 4b. Fallback: send translated text → receiving client speaks via browser TTS [no voiceId]
  */
 
+import { Readable } from "stream";
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
 import type { Server } from "http";
@@ -62,6 +63,7 @@ interface RoomClient {
   roomId: string;
   myLanguage: string;
   friendLanguage: string;
+  voiceId: string | null;
   audioChunks: Buffer[];
   processingTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -121,11 +123,52 @@ async function processAudio(client: RoomClient): Promise<void> {
 
     logger.info({ translatedText }, "Translated text");
 
-    // Step 3 — Forward translated text to the other user; their browser speaks it
     const others = getOtherClients(client);
-    for (const other of others) {
-      if (other.ws.readyState === WebSocket.OPEN) {
-        other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
+
+    // Step 3a — If sender has a cloned voice, use ElevenLabs TTS and send audio
+    if (client.voiceId && others.length > 0) {
+      try {
+        logger.info({ voiceId: client.voiceId, textLen: translatedText.length }, "Generating TTS with cloned voice");
+
+        const audioStream = await eleven.textToSpeech.convert(client.voiceId, {
+          model_id: "eleven_multilingual_v2",
+          text: translatedText,
+          voice_settings: {
+            stability: 0.45,
+            similarity_boost: 0.80,
+          },
+        });
+
+        const ttsBuffer = await readableToBuffer(audioStream as unknown as Readable);
+        const base64Audio = ttsBuffer.toString("base64");
+
+        for (const other of others) {
+          if (other.ws.readyState === WebSocket.OPEN) {
+            other.ws.send(JSON.stringify({
+              type: "audio_data",
+              data: base64Audio,
+              text: translatedText,
+              mimeType: "audio/mpeg",
+            }));
+          }
+        }
+
+        logger.info({ bytes: ttsBuffer.length }, "TTS audio sent to peer");
+      } catch (ttsErr) {
+        // TTS failed — fall back to text so the other user still hears something
+        logger.warn({ ttsErr }, "ElevenLabs TTS failed, falling back to text");
+        for (const other of others) {
+          if (other.ws.readyState === WebSocket.OPEN) {
+            other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
+          }
+        }
+      }
+    } else {
+      // Step 3b — No cloned voice: forward text for browser Web Speech API
+      for (const other of others) {
+        if (other.ws.readyState === WebSocket.OPEN) {
+          other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
+        }
       }
     }
 
@@ -159,6 +202,7 @@ export function setupTranslationWebSocket(server: Server): void {
       roomId: "",
       myLanguage: "english",
       friendLanguage: "telugu",
+      voiceId: null,
       audioChunks: [],
       processingTimer: null,
     };
@@ -176,14 +220,18 @@ export function setupTranslationWebSocket(server: Server): void {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "start") {
-          client.roomId       = msg.roomId       || "default";
-          client.myLanguage   = msg.myLanguage   || "english";
+          client.roomId         = msg.roomId         || "default";
+          client.myLanguage     = msg.myLanguage     || "english";
           client.friendLanguage = msg.friendLanguage || "telugu";
+          client.voiceId        = msg.voiceId        || null;
 
           if (!rooms.has(client.roomId)) rooms.set(client.roomId, []);
           rooms.get(client.roomId)!.push(client);
 
-          logger.info({ roomId: client.roomId, myLanguage: client.myLanguage }, "Client joined room");
+          logger.info(
+            { roomId: client.roomId, myLanguage: client.myLanguage, hasVoice: !!client.voiceId },
+            "Client joined room",
+          );
           sendStatus(ws, "listening");
         }
       } catch {
