@@ -31,8 +31,8 @@ export default function Call() {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  // Buffer for incoming audio-meta mimeType
-  const pendingMimeTypeRef = useRef<string>("audio/mp3");
+  // Ref to track active speech utterance (for cancellation)
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -110,16 +110,24 @@ export default function Call() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // --- Play translated audio received from WebSocket ---
-  const playTranslatedAudio = useCallback((buffer: ArrayBuffer, mimeType: string) => {
-    const blob = new Blob([buffer], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    audio.onended = () => {
-      URL.revokeObjectURL(url);
-      setStatus("listening");
+  // --- Speak translated text via browser Web Speech API ---
+  const speakText = useCallback((text: string, lang: string) => {
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel(); // stop any in-progress speech
+
+    const langCode: Record<string, string> = {
+      english: "en-US",
+      telugu:  "te-IN",
     };
-    audio.play().catch((err) => console.error("Audio play error", err));
+
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = langCode[lang] ?? "en-US";
+    utter.rate = 0.95;
+    utter.onstart  = () => setStatus("speaking");
+    utter.onend    = () => setStatus("listening");
+    utter.onerror  = () => setStatus("listening");
+    utteranceRef.current = utter;
+    window.speechSynthesis.speak(utter);
   }, []);
 
   // --- Translation WebSocket management ---
@@ -144,15 +152,12 @@ export default function Call() {
           const msg = JSON.parse(event.data);
           if (msg.type === "status") {
             setStatus(msg.status as CallStatus);
-          } else if (msg.type === "audio-meta") {
-            pendingMimeTypeRef.current = msg.mimeType || "audio/mp3";
+          } else if (msg.type === "speech") {
+            speakText(msg.text as string, msg.lang as string);
           }
         } catch {
           // ignore
         }
-      } else if (event.data instanceof ArrayBuffer) {
-        playTranslatedAudio(event.data, pendingMimeTypeRef.current);
-        setStatus("speaking");
       }
     };
 
@@ -227,9 +232,11 @@ export default function Call() {
     } catch (err) {
       console.error("Mic access failed", err);
     }
-  }, [roomId, myLanguage, friendLanguage, playTranslatedAudio]);
+  }, [roomId, myLanguage, friendLanguage, speakText]);
 
   const stopTranslation = useCallback(() => {
+    window.speechSynthesis?.cancel();
+    utteranceRef.current = null;
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());

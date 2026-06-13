@@ -13,17 +13,11 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
 import type { Server } from "http";
 import { ElevenLabsClient } from "elevenlabs";
-import { Readable } from "stream";
 import { logger } from "./logger.js";
 
 const eleven = new ElevenLabsClient({
   apiKey: process.env["ELEVENLABS_API_KEY"] ?? "",
 });
-
-// ElevenLabs multilingual v2 model handles English and Telugu well
-const TTS_MODEL = "eleven_multilingual_v2";
-// Rachel — natural-sounding multilingual voice
-const TTS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM";
 
 // Language codes used by ElevenLabs Scribe STT (ISO-639-1 / ISO-639-3)
 const STT_LANG: Record<string, string> = {
@@ -127,22 +121,11 @@ async function processAudio(client: RoomClient): Promise<void> {
 
     logger.info({ translatedText }, "Translated text");
 
-    // Step 3 — TTS: synthesise translated text with ElevenLabs
-    const audioStream = await eleven.textToSpeech.convert(TTS_VOICE_ID, {
-      text: translatedText,
-      model_id: TTS_MODEL,
-      output_format: "mp3_44100_128",
-    });
-
-    const mp3Buffer = await readableToBuffer(audioStream as unknown as Readable);
-
-    // Step 4 — Forward translated audio to the other user(s) in the room
+    // Step 3 — Forward translated text to the other user; their browser speaks it
     const others = getOtherClients(client);
     for (const other of others) {
       if (other.ws.readyState === WebSocket.OPEN) {
-        other.ws.send(JSON.stringify({ type: "audio-meta", mimeType: "audio/mp3" }));
-        other.ws.send(mp3Buffer);
-        sendStatus(other.ws, "speaking");
+        other.ws.send(JSON.stringify({ type: "speech", text: translatedText, lang: friendLang }));
       }
     }
 
