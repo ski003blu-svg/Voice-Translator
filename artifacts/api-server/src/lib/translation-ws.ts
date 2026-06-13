@@ -1,24 +1,33 @@
 /**
- * WebSocket-based live translation server.
+ * WebSocket-based live translation server using Google Gemini.
  *
  * Flow per client:
  * 1. Client connects and sends a JSON "start" message with roomId, myLanguage, friendLanguage
- * 2. Client streams raw audio chunks as binary (ArrayBuffer / Buffer)
- * 3. Server accumulates chunks for ~1s, then sends to OpenAI:
- *    - STT: transcribe the audio
- *    - Translation + TTS: translate the transcript and synthesize speech
- * 4. Server sends translated audio back to the OTHER client in the same room as binary
+ * 2. Client streams raw audio chunks as binary (Buffer)
+ * 3. Server accumulates chunks for ~1.5s of silence, then:
+ *    - Sends audio + translation prompt to gemini-2.0-flash (STT + translate in one shot)
+ *    - Synthesizes translated text to speech via gemini-2.5-flash-preview-tts
+ * 4. Server sends translated MP3 audio back to the OTHER client in the same room as binary
  */
 
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
 import type { Server } from "http";
-import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { logger } from "./logger.js";
 
-const openai = new OpenAI({
-  apiKey: process.env["OPENAI_API_KEY"],
-});
+const genAI = new GoogleGenerativeAI(process.env["GEMINI_API_KEY"] ?? "");
+
+// Translation model — understands audio input natively
+const translationModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+// TTS model — produces audio output
+const ttsModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-tts" });
+
+const langNames: Record<string, string> = {
+  english: "English",
+  telugu: "Telugu",
+};
 
 interface RoomClient {
   ws: WebSocket;
@@ -29,13 +38,19 @@ interface RoomClient {
   processingTimer: ReturnType<typeof setTimeout> | null;
 }
 
-// Map roomId -> list of clients in that room
+// roomId -> clients in that room
 const rooms = new Map<string, RoomClient[]>();
 
 function getOtherClients(client: RoomClient): RoomClient[] {
   const room = rooms.get(client.roomId);
   if (!room) return [];
   return room.filter((c) => c !== client && c.ws.readyState === WebSocket.OPEN);
+}
+
+function sendStatus(ws: WebSocket, status: string): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "status", status }));
+  }
 }
 
 async function processAudio(client: RoomClient): Promise<void> {
@@ -46,88 +61,95 @@ async function processAudio(client: RoomClient): Promise<void> {
 
   const myLang = client.myLanguage;
   const friendLang = client.friendLanguage;
-
-  const langNames: Record<string, string> = {
-    english: "English",
-    telugu: "Telugu",
-  };
+  const myLangName = langNames[myLang] ?? myLang;
+  const friendLangName = langNames[friendLang] ?? friendLang;
 
   try {
-    // Step 1: Transcribe speaker's audio
-    const audioBlob = new Blob([audioBuffer], { type: "audio/webm" });
-    const audioFile = new File([audioBlob], "audio.webm", { type: "audio/webm" });
+    // Notify sender we're working on it
+    sendStatus(client.ws, "translating");
 
-    const transcription = await openai.audio.transcriptions.create({
-      file: audioFile,
-      model: "whisper-1",
-      language: myLang === "telugu" ? "te" : "en",
-    });
+    // Step 1 + 2 combined: STT + Translation in a single Gemini call
+    // Gemini 2.0 Flash can understand audio natively
+    const base64Audio = audioBuffer.toString("base64");
 
-    const transcript = transcription.text.trim();
-    if (!transcript) return;
+    const prompt = `You are a real-time interpreter. The audio contains speech in ${myLangName}.
+Listen to it, transcribe it, and return ONLY the ${friendLangName} translation — no explanation, no original text, just the translated sentence.
+If the audio is silent or unclear, return an empty string.`;
 
-    logger.info({ transcript, myLang, friendLang }, "Transcribed audio");
+    const translationResult = await translationModel.generateContent([
+      {
+        inlineData: {
+          data: base64Audio,
+          mimeType: "audio/webm",
+        },
+      },
+      prompt,
+    ]);
 
-    // Notify client that translation is in progress
-    if (client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(JSON.stringify({ type: "status", status: "translating" }));
+    const translatedText = translationResult.response.text().trim();
+
+    if (!translatedText) {
+      sendStatus(client.ws, "listening");
+      return;
     }
 
-    // Step 2: Translate the text
-    const translationPrompt = `Translate the following ${langNames[myLang]} text to ${langNames[friendLang]}. Return only the translated text, nothing else.\n\n${transcript}`;
+    logger.info({ translatedText, myLang, friendLang }, "Translated text");
 
-    const translationResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: translationPrompt }],
-      max_tokens: 500,
+    // Step 3: Text-to-speech using Gemini 2.5 Flash TTS
+    const ttsPrompt = `Say the following in ${friendLangName} in a clear, natural voice:\n\n${translatedText}`;
+
+    const ttsResult = await ttsModel.generateContent({
+      contents: [{ role: "user", parts: [{ text: ttsPrompt }] }],
+      generationConfig: {
+        // @ts-expect-error - responseModalities is a valid field for TTS model
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              // Aoede works well for both English and Telugu
+              voiceName: "Aoede",
+            },
+          },
+        },
+      },
     });
 
-    const translatedText = translationResponse.choices[0]?.message?.content?.trim();
-    if (!translatedText) return;
+    // Extract audio data from TTS response
+    const audioPart = ttsResult.response.candidates?.[0]?.content?.parts?.[0];
+    if (!audioPart?.inlineData?.data) {
+      logger.warn("TTS returned no audio data");
+      sendStatus(client.ws, "listening");
+      return;
+    }
 
-    logger.info({ translatedText }, "Translated text");
+    const audioData = Buffer.from(audioPart.inlineData.data, "base64");
+    const mimeType = audioPart.inlineData.mimeType ?? "audio/mp3";
 
-    // Step 3: Convert translated text to speech
-    const ttsVoice = friendLang === "telugu" ? "nova" : "alloy";
-    const speechResponse = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: ttsVoice,
-      input: translatedText,
-      response_format: "mp3",
-    });
-
-    const speechBuffer = Buffer.from(await speechResponse.arrayBuffer());
-
-    // Step 4: Send translated audio to OTHER clients in the room
+    // Step 4: Send translated audio to the OTHER clients in the room
     const others = getOtherClients(client);
     for (const other of others) {
       if (other.ws.readyState === WebSocket.OPEN) {
-        other.ws.send(speechBuffer);
-        other.ws.send(JSON.stringify({ type: "status", status: "speaking" }));
+        // Send mime type header first so client knows how to play it
+        other.ws.send(JSON.stringify({ type: "audio-meta", mimeType }));
+        other.ws.send(audioData);
+        sendStatus(other.ws, "speaking");
       }
     }
 
-    // Signal done to sender
-    if (client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(JSON.stringify({ type: "status", status: "listening" }));
-    }
+    sendStatus(client.ws, "listening");
   } catch (err) {
     logger.error({ err }, "Translation pipeline error");
+    sendStatus(client.ws, "listening");
     if (client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(JSON.stringify({ type: "error", message: "Translation failed" }));
+      client.ws.send(JSON.stringify({ type: "error", message: "Translation failed, please try again" }));
     }
   }
 }
 
 function scheduleProcessing(client: RoomClient): void {
-  if (client.processingTimer) {
-    clearTimeout(client.processingTimer);
-  }
-  // Process audio after 1.5s of silence
+  if (client.processingTimer) clearTimeout(client.processingTimer);
   client.processingTimer = setTimeout(() => {
-    processAudio(client).catch((err) => {
-      logger.error({ err }, "Error processing audio");
-    });
+    processAudio(client).catch((err) => logger.error({ err }, "Error in processAudio"));
   }, 1500);
 }
 
@@ -146,36 +168,32 @@ export function setupTranslationWebSocket(server: Server): void {
       processingTimer: null,
     };
 
-    ws.on("message", (data: Buffer | string, isBinary: boolean) => {
-      if (!isBinary && typeof data === "object" || typeof data === "string") {
-        // Try to parse as JSON control message
-        try {
-          const text = data.toString();
-          const msg = JSON.parse(text);
-
-          if (msg.type === "start") {
-            client.roomId = msg.roomId || "default";
-            client.myLanguage = msg.myLanguage || "english";
-            client.friendLanguage = msg.friendLanguage || "telugu";
-
-            // Register in room
-            if (!rooms.has(client.roomId)) {
-              rooms.set(client.roomId, []);
-            }
-            rooms.get(client.roomId)!.push(client);
-
-            logger.info({ roomId: client.roomId, myLanguage: client.myLanguage }, "Client joined room");
-            ws.send(JSON.stringify({ type: "status", status: "listening" }));
-          }
-        } catch {
-          // Not JSON — treat as binary audio data
-          if (client.roomId && Buffer.isBuffer(data)) {
-            client.audioChunks.push(data);
-            scheduleProcessing(client);
-          }
-        }
-      } else if (isBinary && Buffer.isBuffer(data)) {
+    ws.on("message", (data: Buffer, isBinary: boolean) => {
+      if (isBinary) {
         // Binary audio chunk
+        if (client.roomId) {
+          client.audioChunks.push(data);
+          scheduleProcessing(client);
+        }
+        return;
+      }
+
+      // Text control message
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "start") {
+          client.roomId = msg.roomId || "default";
+          client.myLanguage = msg.myLanguage || "english";
+          client.friendLanguage = msg.friendLanguage || "telugu";
+
+          if (!rooms.has(client.roomId)) rooms.set(client.roomId, []);
+          rooms.get(client.roomId)!.push(client);
+
+          logger.info({ roomId: client.roomId, myLanguage: client.myLanguage }, "Client joined room");
+          sendStatus(ws, "listening");
+        }
+      } catch {
+        // Non-JSON text, treat as binary audio fallback
         if (client.roomId) {
           client.audioChunks.push(data);
           scheduleProcessing(client);
@@ -187,7 +205,6 @@ export function setupTranslationWebSocket(server: Server): void {
       logger.info({ roomId: client.roomId }, "WebSocket client disconnected");
       if (client.processingTimer) clearTimeout(client.processingTimer);
 
-      // Remove from room
       if (client.roomId) {
         const room = rooms.get(client.roomId);
         if (room) {
@@ -198,9 +215,7 @@ export function setupTranslationWebSocket(server: Server): void {
       }
     });
 
-    ws.on("error", (err) => {
-      logger.error({ err }, "WebSocket error");
-    });
+    ws.on("error", (err) => logger.error({ err }, "WebSocket error"));
   });
 
   logger.info("WebSocket translation server ready at /ws/translate");
