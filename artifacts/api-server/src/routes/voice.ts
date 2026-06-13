@@ -17,29 +17,15 @@ router.post(
       const audioBuffer = req.body as Buffer;
 
       if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length < 500) {
-        res.status(400).json({
-          error: "Audio sample too short or missing",
-        });
+        res.status(400).json({ error: "Audio sample too short or missing" });
         return;
       }
 
-      logger.info(
-        { bytes: audioBuffer.length },
-        "Voice clone request received",
-      );
+      logger.info({ bytes: audioBuffer.length }, "Voice clone request received");
 
-      const arrayBuffer = audioBuffer.buffer.slice(
-        audioBuffer.byteOffset,
-        audioBuffer.byteOffset + audioBuffer.byteLength,
-      ) as ArrayBuffer;
-
-      const file = new File(
-        [arrayBuffer],
-        "voice-sample.webm",
-        {
-          type: "audio/webm",
-        },
-      );
+      const file = new File([audioBuffer], "voice-sample.webm", {
+        type: "audio/webm",
+      });
 
       const voice = await eleven.voices.add({
         name: `MissU-${Date.now()}`,
@@ -47,23 +33,11 @@ router.post(
         description: "Real-time translation voice clone",
       });
 
-      logger.info(
-        { voiceId: voice.voice_id },
-        "Voice cloned successfully",
-      );
-
-      res.json({
-        voiceId: voice.voice_id,
-      });
+      logger.info({ voiceId: voice.voice_id }, "Voice cloned successfully");
+      res.json({ voiceId: voice.voice_id });
     } catch (err) {
-      logger.error(
-        { err },
-        "Voice cloning failed",
-      );
-
-      res.status(500).json({
-        error: "Voice cloning failed. Please try again.",
-      });
+      logger.error({ err }, "Voice cloning failed");
+      res.status(500).json({ error: "Voice cloning failed. Please try again." });
     }
   },
 );
