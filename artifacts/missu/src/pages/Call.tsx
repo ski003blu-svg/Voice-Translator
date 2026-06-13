@@ -33,6 +33,8 @@ export default function Call() {
   const micStreamRef = useRef<MediaStream | null>(null);
   // Ref to track active speech utterance (for cancellation)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  // Blocks VAD audio sending while TTS is playing to prevent echo feedback
+  const isTTSActiveRef = useRef(false);
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -123,9 +125,18 @@ export default function Call() {
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = langCode[lang] ?? "en-US";
     utter.rate = 0.95;
-    utter.onstart  = () => setStatus("speaking");
-    utter.onend    = () => setStatus("listening");
-    utter.onerror  = () => setStatus("listening");
+    utter.onstart = () => {
+      isTTSActiveRef.current = true; // block mic sending while TTS plays
+      setStatus("speaking");
+    };
+    utter.onend = () => {
+      isTTSActiveRef.current = false;
+      setStatus("listening");
+    };
+    utter.onerror = () => {
+      isTTSActiveRef.current = false;
+      setStatus("listening");
+    };
     utteranceRef.current = utter;
     window.speechSynthesis.speak(utter);
   }, []);
@@ -182,8 +193,6 @@ export default function Call() {
       mediaRecorderRef.current = recorder;
 
       // --- Voice Activity Detection via Web Audio API ---
-      // Only sends audio to the server when the mic volume crosses the speech
-      // threshold, so we don't burn Gemini quota on silence.
       const audioCtx = new AudioContext();
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -193,18 +202,28 @@ export default function Call() {
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let isSpeaking = false;
       let silenceFrames = 0;
-      const SPEECH_THRESHOLD = 18;   // RMS level (0-255) to treat as active speech
-      const SILENCE_END_FRAMES = 25; // ~800ms of quiet after speech before we close the segment
+      const SPEECH_THRESHOLD = 25;   // RMS level — raised to reduce false triggers
+      const SILENCE_END_FRAMES = 30; // ~1s of quiet after speech before closing segment
 
       const checkVAD = () => {
         if (!wsRef.current) return; // stop loop when WS closes
         analyser.getByteFrequencyData(dataArray);
         const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
+        // Never start or continue recording while TTS is playing — prevents echo feedback
+        if (isTTSActiveRef.current) {
+          if (isSpeaking && recorder.state === "recording") {
+            isSpeaking = false;
+            recorder.stop(); // discard what was recorded (it's TTS echo)
+          }
+          silenceFrames = 0;
+          requestAnimationFrame(checkVAD);
+          return;
+        }
+
         if (avg > SPEECH_THRESHOLD) {
           silenceFrames = 0;
           if (!isSpeaking && recorder.state === "inactive") {
-            // Start capturing this utterance
             isSpeaking = true;
             setStatus("listening");
             recorder.start();
@@ -212,7 +231,6 @@ export default function Call() {
         } else {
           silenceFrames++;
           if (isSpeaking && silenceFrames > SILENCE_END_FRAMES) {
-            // Speech ended — stop recording; ondataavailable fires with the full clip
             isSpeaking = false;
             if (recorder.state === "recording") recorder.stop();
           }
@@ -221,11 +239,11 @@ export default function Call() {
       };
 
       // When a speech segment finishes, send the full clip to the server
+      // (also guarded: skip if TTS was active when the segment ended)
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN && !isTTSActiveRef.current) {
           e.data.arrayBuffer().then((buf) => wsRef.current?.send(buf));
         }
-        // Recorder is now "inactive" — VAD will call recorder.start() again on next utterance
       };
 
       checkVAD(); // start the detection loop
@@ -257,6 +275,15 @@ export default function Call() {
       if (!isTranslating) stopTranslation();
     };
   }, [isTranslating, startTranslation, stopTranslation]);
+
+  // When translation is ON, mute the local Agora track so the other person
+  // hears ONLY the translated TTS voice — not the raw original voice.
+  // When translation is OFF, restore the track (unless the user manually muted).
+  useEffect(() => {
+    if (localTrackRef.current) {
+      localTrackRef.current.setMuted(isTranslating ? true : isMuted);
+    }
+  }, [isTranslating, isMuted]);
 
   // Cleanup on unmount
   useEffect(() => {
