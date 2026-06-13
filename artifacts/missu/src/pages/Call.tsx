@@ -150,8 +150,18 @@ export default function Call() {
     window.speechSynthesis.resume();
 
     const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = langCode[lang] ?? "en-US";
+    const targetLang = langCode[lang] ?? "en-US";
+    utter.lang = targetLang;
     utter.rate = 0.92;
+
+    // On Android Chrome voices may not be loaded yet, or te-IN may not exist.
+    // If no voice matches the target language, let the browser use its default
+    // (utterance still plays — it just won't be in the right accent/language).
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      const match = voices.find((v) => v.lang.startsWith(targetLang.split("-")[0]));
+      if (match) utter.voice = match;
+    }
 
     const releaseLock = () => {
       if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
@@ -497,7 +507,16 @@ export default function Call() {
             data-testid="button-toggle-translation"
             variant="ghost"
             size="icon"
-            onClick={() => setIsTranslating(!isTranslating)}
+            onClick={() => {
+              // Prime speechSynthesis synchronously inside the user gesture so mobile
+              // browsers (Android Chrome) unlock audio before the async pipeline fires.
+              if (!isTranslating && window.speechSynthesis) {
+                const primer = new SpeechSynthesisUtterance(" ");
+                primer.volume = 0;
+                window.speechSynthesis.speak(primer);
+              }
+              setIsTranslating(!isTranslating);
+            }}
             className={`w-14 h-14 rounded-2xl transition-all ${
               isTranslating
                 ? "bg-primary text-primary-foreground shadow-[0_0_15px_rgba(59,130,246,0.4)]"
