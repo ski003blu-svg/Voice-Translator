@@ -21,6 +21,8 @@ export default function Call() {
   const [status, setStatus] = useState<CallStatus>("idle");
   const [isConnected, setIsConnected] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  // Caption: last translation received from the other user
+  const [caption, setCaption] = useState<string>("");
 
   // Agora refs
   const clientRef = useRef<IAgoraRTCClient | null>(null);
@@ -33,8 +35,12 @@ export default function Call() {
   const micStreamRef = useRef<MediaStream | null>(null);
   // Ref to track active speech utterance (for cancellation)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  // Blocks VAD audio sending while TTS is playing to prevent echo feedback
+  // Blocks VAD audio sending while TTS is playing (set BEFORE speak() to close the gap)
   const isTTSActiveRef = useRef(false);
+  // Holds the latest speech to play after the current one finishes (prevents cancellation cascade)
+  const pendingSpeechRef = useRef<{ text: string; lang: string } | null>(null);
+  // Ref to the speakText function itself so callbacks can call it without stale closure
+  const speakTextRef = useRef<(text: string, lang: string) => void>(() => {});
 
   const getTokenMutation = useGetAgoraToken();
 
@@ -113,33 +119,57 @@ export default function Call() {
   }, [roomId]);
 
   // --- Speak translated text via browser Web Speech API ---
+  // Queue-based: if already speaking, store latest text and speak it when done.
+  // isTTSActiveRef is set IMMEDIATELY (not in onstart) to close the echo gap.
   const speakText = useCallback((text: string, lang: string) => {
     if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel(); // stop any in-progress speech
+
+    // If TTS is already playing, queue this as the next utterance (replace older pending)
+    if (isTTSActiveRef.current) {
+      pendingSpeechRef.current = { text, lang };
+      return;
+    }
 
     const langCode: Record<string, string> = {
       english: "en-US",
       telugu:  "te-IN",
     };
 
+    // Block VAD IMMEDIATELY — before speak() — so there's no window where mic is open
+    isTTSActiveRef.current = true;
+    setStatus("speaking");
+    setCaption(text);
+
+    window.speechSynthesis.cancel();
+
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = langCode[lang] ?? "en-US";
-    utter.rate = 0.95;
-    utter.onstart = () => {
-      isTTSActiveRef.current = true; // block mic sending while TTS plays
-      setStatus("speaking");
+    utter.rate = 0.92;
+
+    const onDone = () => {
+      // 600ms cooldown after TTS ends — prevents mic from immediately picking up speaker echo
+      setTimeout(() => {
+        isTTSActiveRef.current = false;
+        const next = pendingSpeechRef.current;
+        pendingSpeechRef.current = null;
+        if (next) {
+          speakTextRef.current(next.text, next.lang);
+        } else {
+          setStatus("listening");
+        }
+      }, 600);
     };
-    utter.onend = () => {
-      isTTSActiveRef.current = false;
-      setStatus("listening");
-    };
-    utter.onerror = () => {
-      isTTSActiveRef.current = false;
-      setStatus("listening");
-    };
+
+    utter.onend  = onDone;
+    utter.onerror = onDone;
     utteranceRef.current = utter;
     window.speechSynthesis.speak(utter);
   }, []);
+
+  // Keep speakTextRef in sync so the onDone callback can call the latest version
+  useEffect(() => {
+    speakTextRef.current = speakText;
+  }, [speakText]);
 
   // --- Translation WebSocket management ---
   const startTranslation = useCallback(async () => {
@@ -255,12 +285,15 @@ export default function Call() {
   const stopTranslation = useCallback(() => {
     window.speechSynthesis?.cancel();
     utteranceRef.current = null;
+    isTTSActiveRef.current = false;
+    pendingSpeechRef.current = null;
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
+    setCaption("");
     setStatus("idle");
   }, []);
 
@@ -386,7 +419,7 @@ export default function Call() {
           </div>
         </div>
 
-        <div className="mt-12 text-center px-6">
+        <div className="mt-8 text-center px-6 flex flex-col items-center gap-4">
           {connectError ? (
             <div className="flex flex-col items-center gap-3">
               <p data-testid="status-call-status" className="text-sm text-destructive text-center leading-snug max-w-xs">
@@ -409,6 +442,14 @@ export default function Call() {
             >
               {getStatusText()}
             </p>
+          )}
+
+          {/* Translation caption — shows the latest translated text received */}
+          {caption && isTranslating && (
+            <div className="max-w-xs w-full bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
+              <p className="text-xs text-muted-foreground uppercase tracking-widest mb-1">Translation</p>
+              <p className="text-sm text-white/90 leading-relaxed">{caption}</p>
+            </div>
           )}
         </div>
       </main>
