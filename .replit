@@ -29,3 +29,10 @@ externalPort = 80
 [[ports]]
 localPort = 18458
 externalPort = 3000
+
+[userenv]
+
+[userenv.shared]
+AGORA_APP_ID = "fdb1404098b9408fad9044213842db02"
+AGORA_APP_CERTIFICATE = "cc0bf0917099414a88ea2aefaa7ee6ec"
+ELEVENLABS_API_KEY = "sk_68ca128cfb0a8be4745d26b2de2e3e7e86482b7f21d65f89"
