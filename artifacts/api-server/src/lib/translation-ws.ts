@@ -24,6 +24,30 @@ const translationModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" })
 // TTS model — produces audio output
 const ttsModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-tts" });
 
+// Retry a Gemini call with exponential backoff on 429 quota errors
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastError = err;
+      const status = (err as { status?: number })?.status;
+      if (status === 429 && attempt < maxRetries) {
+        // Extract retry delay from error message, default to 10s doubling each attempt
+        const retryMatch = String(err).match(/retryDelay.*?(\d+)s/);
+        const waitSecs = retryMatch ? parseInt(retryMatch[1]) : Math.pow(2, attempt + 1) * 5;
+        const waitMs = Math.min(waitSecs * 1000, 60_000);
+        logger.warn({ attempt, waitMs }, "Gemini quota hit, retrying after delay");
+        await new Promise((res) => setTimeout(res, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
 const langNames: Record<string, string> = {
   english: "English",
   telugu: "Telugu",
@@ -76,15 +100,12 @@ async function processAudio(client: RoomClient): Promise<void> {
 Listen to it, transcribe it, and return ONLY the ${friendLangName} translation — no explanation, no original text, just the translated sentence.
 If the audio is silent or unclear, return an empty string.`;
 
-    const translationResult = await translationModel.generateContent([
-      {
-        inlineData: {
-          data: base64Audio,
-          mimeType: "audio/webm",
-        },
-      },
-      prompt,
-    ]);
+    const translationResult = await withRetry(() =>
+      translationModel.generateContent([
+        { inlineData: { data: base64Audio, mimeType: "audio/webm" } },
+        prompt,
+      ])
+    );
 
     const translatedText = translationResult.response.text().trim();
 
@@ -98,21 +119,22 @@ If the audio is silent or unclear, return an empty string.`;
     // Step 3: Text-to-speech using Gemini 2.5 Flash TTS
     const ttsPrompt = `Say the following in ${friendLangName} in a clear, natural voice:\n\n${translatedText}`;
 
-    const ttsResult = await ttsModel.generateContent({
-      contents: [{ role: "user", parts: [{ text: ttsPrompt }] }],
-      generationConfig: {
-        // @ts-expect-error - responseModalities is a valid field for TTS model
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              // Aoede works well for both English and Telugu
-              voiceName: "Aoede",
+    const ttsResult = await withRetry(() =>
+      ttsModel.generateContent({
+        contents: [{ role: "user", parts: [{ text: ttsPrompt }] }],
+        generationConfig: {
+          // @ts-expect-error - responseModalities is a valid field for TTS model
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Aoede",
+              },
             },
           },
         },
-      },
-    });
+      })
+    );
 
     // Extract audio data from TTS response
     const audioPart = ttsResult.response.candidates?.[0]?.content?.parts?.[0];

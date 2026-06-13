@@ -20,6 +20,7 @@ export default function Call() {
   const [isTranslating, setIsTranslating] = useState(false);
   const [status, setStatus] = useState<CallStatus>("idle");
   const [isConnected, setIsConnected] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   // Agora refs
   const clientRef = useRef<IAgoraRTCClient | null>(null);
@@ -44,13 +45,21 @@ export default function Call() {
 
     const initCall = async () => {
       try {
+        setConnectError(null);
         const uid = Math.floor(Math.random() * 100000);
 
-        const response = await getTokenMutation.mutateAsync({
-          data: { channelName: roomId, uid },
-        });
+        // Fetch Agora token from backend
+        let response;
+        try {
+          response = await getTokenMutation.mutateAsync({
+            data: { channelName: roomId, uid },
+          });
+        } catch (err) {
+          throw new Error(`Token fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
 
-        const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+        // Use h264 codec — universally supported on mobile (Safari iOS, Android Chrome)
+        const client = AgoraRTC.createClient({ mode: "rtc", codec: "h264" });
         clientRef.current = client;
 
         client.on("user-published", async (user, mediaType) => {
@@ -67,15 +76,27 @@ export default function Call() {
           }
         });
 
-        await client.join(response.appId, response.channelName, response.token, response.uid);
+        // Join the Agora channel
+        try {
+          await client.join(response.appId, response.channelName, response.token, response.uid);
+        } catch (err) {
+          throw new Error(`Channel join failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
 
-        const localTrack = await AgoraRTC.createMicrophoneAudioTrack();
-        localTrackRef.current = localTrack;
-        await client.publish([localTrack]);
+        // Request mic access and publish
+        try {
+          const localTrack = await AgoraRTC.createMicrophoneAudioTrack();
+          localTrackRef.current = localTrack;
+          await client.publish([localTrack]);
+        } catch (err) {
+          throw new Error(`Microphone access failed — please allow mic permission and retry: ${err instanceof Error ? err.message : String(err)}`);
+        }
 
         setIsConnected(true);
       } catch (err) {
-        console.error("Failed to join call", err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("Failed to join call:", msg);
+        setConnectError(msg);
       }
     };
 
@@ -274,7 +295,12 @@ export default function Call() {
             }`}
           />
           <div className="w-48 h-48 bg-secondary rounded-full flex items-center justify-center border border-white/5 shadow-2xl overflow-hidden">
-            {!isConnected ? (
+            {connectError ? (
+              <div className="flex flex-col items-center p-4">
+                <span className="text-2xl mb-1">⚠️</span>
+                <span className="text-xs text-destructive text-center leading-tight">Failed</span>
+              </div>
+            ) : !isConnected ? (
               <div className="flex flex-col items-center animate-pulse">
                 <Activity className="w-8 h-8 text-muted-foreground mb-2" />
                 <span className="text-sm text-muted-foreground">Connecting...</span>
@@ -287,13 +313,30 @@ export default function Call() {
           </div>
         </div>
 
-        <div className="mt-12 text-center h-8">
-          <p
-            data-testid="status-call-status"
-            className={`text-lg font-medium transition-colors duration-300 ${getStatusColor()}`}
-          >
-            {getStatusText()}
-          </p>
+        <div className="mt-12 text-center px-6">
+          {connectError ? (
+            <div className="flex flex-col items-center gap-3">
+              <p data-testid="status-call-status" className="text-sm text-destructive text-center leading-snug max-w-xs">
+                {connectError}
+              </p>
+              <Button
+                data-testid="button-retry-connect"
+                size="sm"
+                variant="outline"
+                className="border-white/20 text-white hover:bg-white/10"
+                onClick={() => window.location.reload()}
+              >
+                Retry
+              </Button>
+            </div>
+          ) : (
+            <p
+              data-testid="status-call-status"
+              className={`text-lg font-medium transition-colors duration-300 ${getStatusColor()}`}
+            >
+              {getStatusText()}
+            </p>
+          )}
         </div>
       </main>
 

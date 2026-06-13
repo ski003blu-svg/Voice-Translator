@@ -16,9 +16,9 @@ export default function Join() {
     e.preventDefault();
     if (!roomId.trim()) return;
     
-    // Navigate with query params
+    // Normalize to uppercase so "room1" and "ROOM1" always join the same channel
     const params = new URLSearchParams({
-      roomId: roomId.trim(),
+      roomId: roomId.trim().toUpperCase(),
       myLanguage,
       friendLanguage
     });
