@@ -3,13 +3,15 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: MissU Live Voice Translation API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: agora
+    description: Agora token generation
 paths:
   /healthz:
     get:
@@ -24,6 +26,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /agora-token:
+    post:
+      operationId: getAgoraToken
+      tags: [agora]
+      summary: Generate Agora RTC token
+      description: Generates a secure Agora RTC token for joining a channel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgoraTokenInput"
+      responses:
+        "200":
+          description: Token generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgoraTokenResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +69,42 @@ components:
       required:
         - status
 
+    AgoraTokenInput:
+      type: object
+      required:
+        - channelName
+        - uid
+      properties:
+        channelName:
+          type: string
+          description: The Agora channel name (room ID)
+        uid:
+          type: integer
+          description: The user ID for the channel
+
+    AgoraTokenResponse:
+      type: object
+      required:
+        - token
+        - appId
+        - channelName
+        - uid
+      properties:
+        token:
+          type: string
+          description: The generated Agora RTC token
+        appId:
+          type: string
+          description: The Agora App ID
+        channelName:
+          type: string
+        uid:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
