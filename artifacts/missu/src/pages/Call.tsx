@@ -158,16 +158,29 @@ export default function Call() {
 
     const utter = new SpeechSynthesisUtterance(text);
     const targetLang = langCode[lang] ?? "en-US";
-    utter.lang = targetLang;
     utter.rate = 0.92;
 
-    // On Android Chrome voices may not be loaded yet, or te-IN may not exist.
-    // If no voice matches the target language, let the browser use its default
-    // (utterance still plays — it just won't be in the right accent/language).
+    // Voice selection: prefer exact match, then same language prefix (e.g. "te"),
+    // then any available voice as fallback.
+    // IMPORTANT: Only set utter.lang when we have a confirmed voice for it.
+    // If lang is set to e.g. "te-IN" but no Telugu voice exists, browsers
+    // silently discard the utterance — causing complete audio silence.
     const voices = window.speechSynthesis.getVoices();
     if (voices.length > 0) {
-      const match = voices.find((v) => v.lang.startsWith(targetLang.split("-")[0]));
-      if (match) utter.voice = match;
+      const langPrefix = targetLang.split("-")[0];
+      const exactMatch  = voices.find((v) => v.lang === targetLang);
+      const prefixMatch = voices.find((v) => v.lang.startsWith(langPrefix));
+      const bestMatch   = exactMatch ?? prefixMatch;
+      if (bestMatch) {
+        // A voice for this language exists — use it
+        utter.voice = bestMatch;
+        utter.lang  = bestMatch.lang;
+      }
+      // If no voice found for the target language, leave utter.lang unset so the
+      // browser uses its default voice and actually speaks rather than going silent.
+    } else {
+      // Voices list not populated yet — set lang and hope the browser handles it
+      utter.lang = targetLang;
     }
 
     const releaseLock = () => {
