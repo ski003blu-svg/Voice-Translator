@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: missu
+    runtime: node
+    region: oregon
+    plan: free
+
+    buildCommand: |
+      npm install -g pnpm &&
+      pnpm install --frozen-lockfile &&
+      BASE_PATH=/ pnpm --filter @workspace/missu run build &&
+      pnpm --filter @workspace/api-server run build
+
+    startCommand: NODE_ENV=production pnpm --filter @workspace/api-server run start
+
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: AGORA_APP_ID
+        sync: false
+      - key: AGORA_APP_CERTIFICATE
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
