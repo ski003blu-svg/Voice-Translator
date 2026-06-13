@@ -1,0 +1,90 @@
+Build a website MVP called “MissU Live Voice Translation” using React + Node.js backend.
+
+This is a web app, not a mobile app.
+
+Use Agora Web SDK for real-time voice calling.
+
+Main goal:
+Create a simple live voice translation calling website for Telugu ↔ English.
+
+Do not build chat, stories, groups, payments, social feed, or extra WhatsApp features.
+
+Frontend:
+- React
+- Vite
+- Tailwind CSS
+- Agora Web SDK
+
+Backend:
+- Node.js
+- Express
+- WebSocket
+- OpenAI Realtime API
+
+Website pages:
+1. Home page
+2. Join Call page
+3. Live Call page
+
+Home page:
+- App name: MissU Live Voice Translation
+- Tagline: Talk in your language. Hear in theirs.
+- Button: Start Live Call
+
+Join Call page:
+- Input: Room ID
+- Dropdown: My language
+  - English
+  - Telugu
+- Dropdown: Friend language
+  - English
+  - Telugu
+- Button: Join Call
+
+Live Call page:
+- Show Room ID
+- Show language pair: Telugu ⇄ English
+- Button: Enable Live Translation
+- Button: Mute
+- Button: Speaker
+- Button: End Call
+- Status text:
+  - Listening
+  - Translating
+  - Speaking
+
+Core functionality:
+- Two users can join the same Agora channel using the same Room ID.
+- Use Agora Web SDK for browser-based voice calling.
+- First make normal Agora voice call work.
+- Then add live translation.
+- Capture microphone audio from the browser.
+- Send audio chunks to Node.js backend through WebSocket.
+- Backend sends the audio to OpenAI Realtime API.
+- If user speaks Telugu, translate to English voice.
+- If user speaks English, translate to Telugu voice.
+- Backend sends translated voice audio back to the other user.
+- Browser plays translated voice audio automatically.
+- Do not show text translation in the main UI.
+- Only use text logs for debugging.
+
+Environment variables:
+AGORA_APP_ID=
+AGORA_APP_CERTIFICATE=
+OPENAI_API_KEY=
+
+Backend requirements:
+- Create API endpoint: /api/agora-token
+- This endpoint should generate Agora RTC token securely.
+- Create WebSocket endpoint: /ws/translate
+- WebSocket should receive live audio chunks from React.
+- WebSocket should return translated audio chunks.
+- Never expose Agora App Certificate or OpenAI API Key in React.
+
+Important:
+- Build Telugu ↔ English only.
+- Target delay: 1–2 seconds.
+- Optimize for low latency.
+- Add clean modern UI.
+- Add full setup instructions for Replit.
+- Add clear comments in code.
