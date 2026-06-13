@@ -170,9 +170,10 @@ If the audio is silent or unclear, return an empty string.`;
 
 function scheduleProcessing(client: RoomClient): void {
   if (client.processingTimer) clearTimeout(client.processingTimer);
+  // Client sends complete utterances (VAD-gated), so process quickly after receiving
   client.processingTimer = setTimeout(() => {
     processAudio(client).catch((err) => logger.error({ err }, "Error in processAudio"));
-  }, 1500);
+  }, 200);
 }
 
 export function setupTranslationWebSocket(server: Server): void {

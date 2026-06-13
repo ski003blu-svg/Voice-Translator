@@ -151,7 +151,6 @@ export default function Call() {
           // ignore
         }
       } else if (event.data instanceof ArrayBuffer) {
-        // Translated audio from the server — play it
         playTranslatedAudio(event.data, pendingMimeTypeRef.current);
         setStatus("speaking");
       }
@@ -163,7 +162,9 @@ export default function Call() {
       setStatus("idle");
     };
 
-    // Capture mic audio separately for translation streaming
+    // Capture mic audio with Voice Activity Detection (VAD)
+    // Only sends audio to the server when the user is actually speaking,
+    // which prevents burning through Gemini quota on silence.
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
@@ -175,16 +176,54 @@ export default function Call() {
       const recorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = recorder;
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          e.data.arrayBuffer().then((buf) => {
-            wsRef.current?.send(buf);
-          });
+      // --- Voice Activity Detection via Web Audio API ---
+      // Only sends audio to the server when the mic volume crosses the speech
+      // threshold, so we don't burn Gemini quota on silence.
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let isSpeaking = false;
+      let silenceFrames = 0;
+      const SPEECH_THRESHOLD = 18;   // RMS level (0-255) to treat as active speech
+      const SILENCE_END_FRAMES = 25; // ~800ms of quiet after speech before we close the segment
+
+      const checkVAD = () => {
+        if (!wsRef.current) return; // stop loop when WS closes
+        analyser.getByteFrequencyData(dataArray);
+        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+        if (avg > SPEECH_THRESHOLD) {
+          silenceFrames = 0;
+          if (!isSpeaking && recorder.state === "inactive") {
+            // Start capturing this utterance
+            isSpeaking = true;
+            setStatus("listening");
+            recorder.start();
+          }
+        } else {
+          silenceFrames++;
+          if (isSpeaking && silenceFrames > SILENCE_END_FRAMES) {
+            // Speech ended — stop recording; ondataavailable fires with the full clip
+            isSpeaking = false;
+            if (recorder.state === "recording") recorder.stop();
+          }
         }
+        requestAnimationFrame(checkVAD);
       };
 
-      // Send chunks every 500ms for low latency
-      recorder.start(500);
+      // When a speech segment finishes, send the full clip to the server
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+          e.data.arrayBuffer().then((buf) => wsRef.current?.send(buf));
+        }
+        // Recorder is now "inactive" — VAD will call recorder.start() again on next utterance
+      };
+
+      checkVAD(); // start the detection loop
     } catch (err) {
       console.error("Mic access failed", err);
     }
